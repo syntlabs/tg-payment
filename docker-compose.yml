@@ -1,0 +1,38 @@
+services:
+  bot:
+    build: ./src/bot
+    container_name: payment_bot
+    depends_on:
+      - api
+    restart: always
+    volumes:
+      - ./src/bot:/usr/src/bot
+      - ./logs/bot:/usr/log/bot
+    env_file:
+      - .env
+  
+  api:
+    build: ./src/api
+    container_name: payment_api
+    depends_on:
+      - db
+    restart: always
+    volumes:
+      - ./src/api:/usr/src/api
+      - ./logs/api:/usr/log/api
+    env_file:
+      - .env
+    ports:
+      - $API_SERVICE_PORT:$API_SERVICE_PORT
+
+  db:
+    image: postgres
+    container_name: payment_db
+    volumes:
+      - db-data:/var/lib/postgresql/data/
+      - ./src/api/create_tables.sql:/docker-entrypoint-initdb.d/init.sql
+    env_file:
+      - .env
+  
+volumes:
+  db-data:
