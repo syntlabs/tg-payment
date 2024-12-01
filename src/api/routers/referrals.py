@@ -39,26 +39,47 @@ async def add_referral(request: Request, referral: Referral):
 
 
 @router.get("/{telegram_id}")
-async def get_referrals(request: Request, telegram_id: int):
+async def get_info_about_referrals(request: Request, telegram_id: int):
     pool = get_pool_from_request(request)
     async with pool.acquire() as con:
-        records = await con.fetch(
-            "SELECT * FROM referrals WHERE referrer_id=$1;",
-            telegram_id
+        count = await con.fetchval(
+            """
+            WITH RECURSIVE referral_chain AS (
+                SELECT referrer_id, referral_id
+                FROM referrals
+                WHERE referrer_id = $1
+
+                UNION ALL
+
+                SELECT r.referrer_id, r.referral_id
+                FROM referrals r
+                INNER JOIN referral_chain rc ON r.referrer_id = rc.referral_id
+            )
+            SELECT DISTINCT COUNT(*)
+            FROM referral_chain;
+            """, telegram_id
         )
-    return JSONResponse([
-        {k: v for k, v in rec.items()} for rec in records
-    ])
+        
+        total_profit = await con.fetchval(
+            """
+            SELECT SUM(balance_change)
+            FROM transactions
+            WHERE transaction_type = 'referral_profit'
+            AND user_id = $1;
+            """, telegram_id
+        ) or 0
+
+    return JSONResponse({"count": count, "total_profit": int(total_profit)})
 
 
 @router.get("/referrer/{telegram_id}")
 async def get_referrer(request: Request, telegram_id: int):
     pool = get_pool_from_request(request)
     async with pool.acquire() as con:
-        rec = await con.fetchrow(
-            "SELECT * FROM referrals WHERE referral_id=$1;",
+        referrer = await con.fetchval(
+            "SELECT referrer_id FROM referrals WHERE referral_id = $1;",
             telegram_id
         )
-    if rec:
-        return JSONResponse(dict(rec))
+    if referrer:
+        return JSONResponse({"referrer": referrer})
     return Response(status_code=HTTP_404_NOT_FOUND)

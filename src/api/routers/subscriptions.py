@@ -8,9 +8,10 @@ from string import ascii_letters, ascii_lowercase, digits
 
 from asyncpg.exceptions import UniqueViolationError
 from fastapi import APIRouter, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from starlette.status import (
-    HTTP_201_CREATED, HTTP_401_UNAUTHORIZED, HTTP_500_INTERNAL_SERVER_ERROR
+    HTTP_404_NOT_FOUND, HTTP_500_INTERNAL_SERVER_ERROR
 )
 
 from database import get_pool_from_request
@@ -22,18 +23,78 @@ router = APIRouter()
 logger = getLogger(__name__)
 
 @router.post("/add")
-async def add_subscription(request: Request, subscription: Subscription):
+async def add_or_update_subscription(request: Request, subscription: Subscription):
     pool = get_pool_from_request(request)
+    try:
+        count, interval_type = subscription.expires_on.split()
+    except ValueError:
+        return JSONResponse(
+                {"message": "`expires_on` must be `n day | month | year`"},
+                HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    if "week" in interval_type:
+        q = """
+            INSERT INTO subscriptions(owner_id, code, expires_on)
+            VALUES($1, $2, CURRENT_TIMESTAMP + ($3 || ' week')::INTERVAL)
+            ON CONFLICT(owner_id)
+            DO UPDATE SET expires_on =
+                CASE 
+                    WHEN subscriptions.expires_on < CURRENT_TIMESTAMP THEN CURRENT_TIMESTAMP + ($3 || ' week')::INTERVAL
+                    ELSE subscriptions.expires_on + ($3 || ' week')::INTERVAL
+                END
+            WHERE subscriptions.owner_id = $1
+            RETURNING *;
+            """
+    elif "month" in interval_type:
+        q = """
+            INSERT INTO subscriptions(owner_id, code, expires_on)
+            VALUES($1, $2, CURRENT_TIMESTAMP + ($3 || ' month')::INTERVAL)
+            ON CONFLICT(owner_id)
+            DO UPDATE SET expires_on =
+                CASE 
+                    WHEN subscriptions.expires_on < CURRENT_TIMESTAMP THEN CURRENT_TIMESTAMP + ($3 || ' month')::INTERVAL
+                    ELSE subscriptions.expires_on + ($3 || ' month')::INTERVAL
+                END
+            WHERE subscriptions.owner_id = $1
+            RETURNING *;
+            """
+    elif "year" in interval_type:
+        q = """
+            INSERT INTO subscriptions(owner_id, code, expires_on)
+            VALUES($1, $2, CURRENT_TIMESTAMP + ($3 || ' year')::INTERVAL)
+            ON CONFLICT(owner_id)
+            DO UPDATE SET expires_on =
+                CASE 
+                    WHEN subscriptions.expires_on < CURRENT_TIMESTAMP THEN CURRENT_TIMESTAMP + ($3 || ' year')::INTERVAL
+                    ELSE subscriptions.expires_on + ($3 || ' year')::INTERVAL
+                END
+            WHERE subscriptions.owner_id = $1
+            RETURNING *;
+            """
+    else:
+        q = """
+            INSERT INTO subscriptions(owner_id, code, expires_on)
+            VALUES($1, $2, CURRENT_TIMESTAMP + ($3 || ' day')::INTERVAL)
+            ON CONFLICT(owner_id)
+            DO UPDATE SET expires_on =
+                CASE 
+                    WHEN subscriptions.expires_on < CURRENT_TIMESTAMP THEN CURRENT_TIMESTAMP + ($3 || ' day')::INTERVAL
+                    ELSE subscriptions.expires_on + ($3 || ' day')::INTERVAL
+                END
+            WHERE subscriptions.owner_id = $1
+            RETURNING *;
+            """
 
     while True:
         subscription.code = _generate_code()
         try:
+            
             async with pool.acquire() as con:
-                # Возвращает "INSERT 0 1", если подписка успешно создана, "INSERT 0 0" - в противном случае. Не добавляет запись, если подписка у пользователя уже есть.
-                is_created = await con.execute(
-                    "INSERT INTO subscriptions(owner_id, code, expires_on) VALUES($1, $2, $3) ON CONFLICT(owner_id) DO NOTHING RETURNING 1",
+                await con.execute(
+                    q,
                     subscription.owner_id, subscription.code,
-                    subscription.expires_on
+                    count
                 )
             break
         except UniqueViolationError:
@@ -41,15 +102,45 @@ async def add_subscription(request: Request, subscription: Subscription):
             pass
         except Exception:
             # Хьюстон, у нас проблемы! (неизвестная ошибка)
-            logger.exception("Couldn't add a subscription.")
+            logger.exception("Couldn't add or update a subscription.")
             return Response(
-                {"message": "couldn't add a subscription"},
+                {"message": "couldn't add or update a subscription"},
                 HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+    return Response(subscription.model_dump_json())
+
+
+@router.get("/{tg_id_or_code}")
+async def get_subscription(request: Request, tg_id_or_code: str):
+    """
+    `tg_id_or_code` - telegram_id (int) или код активации,
+    который пользователь ввёл в приложение
+    """
+    pool = get_pool_from_request(request)
+    async with pool.acquire() as con:
+        if tg_id_or_code.isdigit():
+            subscription = await con.fetchrow(
+                "SELECT * FROM subscriptions WHERE owner_id = $1;", int(tg_id_or_code)
+            )
+        else:
+            subscription = await con.fetchrow(
+                "SELECT * FROM subscriptions WHERE code = $1;", tg_id_or_code
+            )
     
-    if bool(int(is_created[-1])):
-        return Response(subscription.model_dump_json(), HTTP_201_CREATED)
-    return JSONResponse({"message": "the subscription has already been added"})
+    if subscription:
+        subscription = {k: v for k, v in subscription.items()}
+        return JSONResponse(jsonable_encoder(subscription))
+    
+    if tg_id_or_code.isdigit():
+        message_text = f"the subscription for user `{tg_id_or_code}` not found"
+    else:
+        message_text = f"the subscription with code `{tg_id_or_code}` not found"
+        
+    return JSONResponse(
+        {"message": message_text},
+        status_code=HTTP_404_NOT_FOUND
+    )
 
 
 def _generate_code(length: int = 10) -> str:
